@@ -164,6 +164,11 @@ library DateTime {
         function toTimestamp(uint16 year, uint8 month, uint8 day) constant returns (uint timestamp) {
                 return toTimestamp(year, month, day, 0, 0, 0);
         }
+
+        function toDay(uint256 timestamp) internal returns (uint256) {
+                MyDateTime memory d = parseTimestamp(timestamp);
+                return uint256(d.year) * 10000 + uint256(d.month) * 100 + uint256(d.day);
+        }
         function toTimestamp(uint16 year, uint8 month, uint8 day, uint8 hour, uint8 minute, uint8 second) constant returns (uint timestamp) {
                 uint16 i;
                 // Year
@@ -290,6 +295,9 @@ contract BasicToken is ERC20Basic {
   * @param _value The amount to be transferred.
   */
   function transfer(address _to, uint256 _value) returns (bool) {
+    require(_to != address(0));
+    require(_value <= balances[msg.sender]);
+
     balances[msg.sender] = balances[msg.sender].sub(_value);
     balances[_to] = balances[_to].add(_value);
     Transfer(msg.sender, _to, _value);
@@ -330,12 +338,13 @@ contract StandardToken is ERC20, BasicToken {
    * @param _value uint256 the amout of tokens to be transfered
    */
   function transferFrom(address _from, address _to, uint256 _value) returns (bool) {
-    var _allowance = allowed[_from][msg.sender];
-    // Check is not needed because sub(_allowance, _value) will already throw if this condition is not met
-    // require (_value <= _allowance);
-    balances[_to] = balances[_to].add(_value);
+    require(_to != address(0));
+    require(_value <= balances[_from]);
+    require(_value <= allowed[_from][msg.sender]);
+
     balances[_from] = balances[_from].sub(_value);
-    allowed[_from][msg.sender] = _allowance.sub(_value);
+    balances[_to] = balances[_to].add(_value);
+    allowed[_from][msg.sender] = allowed[_from][msg.sender].sub(_value);
     Transfer(_from, _to, _value);
     return true;
   }
@@ -413,69 +422,57 @@ contract BurnableToken is StandardToken {
     }
 }
 contract FrozenableToken is Operational, BurnableToken, ReentrancyGuard {
+            using DateTime for uint256;
     uint256 public createTime;
-    struct FrozenBalance {
-        address owner;
+    uint256 public frozenForever;
+    uint256 public frozenAnnually;
+
+    struct FrozenRecord {
         uint256 value;
-        uint256 unFrozenTime;
+        uint256 day;
     }
-    mapping (uint => FrozenBalance) public frozenBalances;
-    uint public frozenBalanceCount;
-    event Freeze(address indexed owner, uint256 value, uint256 releaseTime);
-    event FreezeForOwner(address indexed owner, uint256 value, uint256 releaseTime);
-    event Unfreeze(address indexed owner, uint256 value, uint256 releaseTime);
+    mapping (uint256 => FrozenRecord) public frozenBalances;
+
+    event FreezeForOwner(address indexed owner, uint256 value, uint256 unFrozenTime);
+    event Unfreeze(address indexed owner, uint256 value);
     // freeze _value token to _unFrozenTime
-    function freeze(uint256 _value, uint256 _unFrozenTime) nonReentrant returns (bool) {
-        require(balances[msg.sender] >= _value);
-        require(_unFrozenTime > createTime);
-        require(_unFrozenTime > now);
-        balances[msg.sender] = balances[msg.sender].sub(_value);
-        frozenBalances[frozenBalanceCount] = FrozenBalance({owner: msg.sender, value: _value, unFrozenTime: _unFrozenTime});
-        frozenBalanceCount++;
-        Freeze(msg.sender, _value, _unFrozenTime);
-        return true;
-    }
+
     function freezeForOwner(uint256 _value, uint256 _unFrozenTime) onlyOperator returns(bool) {
         require(balances[owner] >= _value);
         require(_unFrozenTime > createTime);
-        require(_unFrozenTime > now);
-        balances[owner] = balances[owner].sub(_value);
-        frozenBalances[frozenBalanceCount] = FrozenBalance({owner: owner, value: _value, unFrozenTime: _unFrozenTime});
-        frozenBalanceCount++;
-        FreezeForOwner(owner, _value, _unFrozenTime);
+        require(_unFrozenTime > now);  
+        if (_unFrozenTime.parseTimestamp().year - createTime.parseTimestamp().year > 10 ){
+                balances[owner] = balances[owner].sub(_value);
+                frozenForever = frozenForever.add(_value);
+                FreezeForOwner(owner, _value, _unFrozenTime);
+        } else {
+                uint256 day = _unFrozenTime.toDay();
+                if (frozenBalances[day].day == day) {
+                        revert();
+                }
+                balances[owner] = balances[owner].sub(_value);
+                frozenAnnually = frozenAnnually.add(_value);
+                frozenBalances[day] = FrozenRecord( _value, day);
+                FreezeForOwner(owner, _value, _unFrozenTime);
+        }
+
         return true;
     }
-    // get frozen balance
-    function frozenBalanceOf(address _owner) constant returns (uint256 value) {
-        for (uint i = 0; i < frozenBalanceCount; i++) {
-            FrozenBalance storage frozenBalance = frozenBalances[i];
-            if (_owner == frozenBalance.owner) {
-                value = value.add(frozenBalance.value);
-            }
-        }
-        return value;
-    }
+
     // unfreeze frozen amount
-    function unfreeze() returns (uint256 releaseAmount) {
-        uint index = 0;
-        while (index < frozenBalanceCount) {
-            if (now >= frozenBalances[index].unFrozenTime) {
-                releaseAmount += frozenBalances[index].value;
-                unFrozenBalanceByIndex(index);
-            } else {
-                index++;
-            }
+    function unfreeze(uint256 _unFrozenTime) onlyOperator returns (bool) {
+        require(_unFrozenTime < block.timestamp);
+        uint256 day = _unFrozenTime.toDay();
+        uint256 _value = frozenBalances[day].value;
+        if (_value>0) {
+                frozenBalances[day].value = 0;
+                frozenAnnually = frozenAnnually.sub(_value);
+                balances[owner] = balances[owner].add(_value);
+                Unfreeze(owner, _value);
         }
-        return releaseAmount;
+        return true;
     }
-    function unFrozenBalanceByIndex(uint index) internal {
-        FrozenBalance storage frozenBalance = frozenBalances[index];
-        balances[frozenBalance.owner] = balances[frozenBalance.owner].add(frozenBalance.value);
-        Unfreeze(frozenBalance.owner, frozenBalance.value, frozenBalance.unFrozenTime);
-        frozenBalances[index] = frozenBalances[frozenBalanceCount - 1];
-        delete frozenBalances[frozenBalanceCount - 1];
-        frozenBalanceCount--;
-    }
+
 }
 contract DragonReleaseableToken is FrozenableToken {
     using SafeMath for uint;
@@ -485,10 +482,9 @@ contract DragonReleaseableToken is FrozenableToken {
     event ReleaseSupply(address indexed receiver, uint256 value, uint256 releaseTime);
     struct ReleaseRecord {
         uint256 amount; // release amount
-        uint256 releasedTime; // release time
+        uint256 releasedDay;
     }
-    mapping (uint => ReleaseRecord) public releasedRecords;
-    uint public releasedRecordsCount = 0;
+    mapping (uint256 => ReleaseRecord) public releasedRecords;
     function DragonReleaseableToken(
                     address operator
                 ) Operational(operator) {
@@ -500,21 +496,16 @@ contract DragonReleaseableToken is FrozenableToken {
         updateAward(timestamp);
         balances[owner] = balances[owner].add(award);
         totalSupply = totalSupply.add(award);
-        releasedRecords[releasedRecordsCount] = ReleaseRecord(award, timestamp);
-        releasedRecordsCount++;
+        uint256 releasedDay = timestamp.toDay();
+        releasedRecords[releasedDay] = ReleaseRecord(award, releasedDay);
         ReleaseSupply(owner, award, timestamp);
         return award;
     }
     function judgeReleaseRecordExist(uint256 timestamp) internal returns(bool _exist) {
         bool exist = false;
-        if (releasedRecordsCount > 0) {
-            for (uint index = 0; index < releasedRecordsCount; index++) {
-                if ((releasedRecords[index].releasedTime.parseTimestamp().year == timestamp.parseTimestamp().year)
-                    && (releasedRecords[index].releasedTime.parseTimestamp().month == timestamp.parseTimestamp().month)
-                    && (releasedRecords[index].releasedTime.parseTimestamp().day == timestamp.parseTimestamp().day)) {
-                    exist = true;
-                }
-            }
+        uint256 day = timestamp.toDay();
+        if (releasedRecords[day].releasedDay == day){
+            exist = true;
         }
         return exist;
     }
@@ -553,3 +544,4 @@ contract DragonToken is DragonReleaseableToken {
                      address operator
                      ) DragonReleaseableToken(operator) {}
 }
+
